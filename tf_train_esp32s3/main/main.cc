@@ -1,0 +1,596 @@
+
+/* Includes ------------------------------------------------------------------*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "esp_timer.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "sensor.h"
+#include "esp_camera.h"
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "nvs_flash.h"
+#include "esp_spiffs.h"
+#include "file_server.c"
+
+#include "utils.h"
+#include "models/pnet_1.c"
+#include "models/pnet_2.c"
+#include "models/pnet_3.c"
+#include "models/rnet.c"
+#include "models/onet.c"
+
+#include "tensorflow/lite/micro/micro_interpreter.h"
+#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
+#include "tensorflow/lite/micro/all_ops_resolver.h"
+#include "tensorflow/lite/schema/schema_generated.h"
+
+/* Private typedef -----------------------------------------------------------*/
+
+/* Private macro -------------------------------------------------------------*/
+#define SCRATH_BUFFER_SIZE (39 * 1024)
+#define TENSOR_ARENA_SIZE (110 * 1024 + SCRATH_BUFFER_SIZE)
+
+
+
+#define Cam_Power 41
+#define GPIO_OUTPUT_PIN_SEL  ((1ULL<<Cam_Power))
+
+gpio_num_t gpio_num = (gpio_num_t)Cam_Power;
+/* Private variables ---------------------------------------------------------*/
+static const char * TAG = "app"; /* Tag for debugging */
+
+tflite::MicroInterpreter * pnet_1_interpreter = nullptr;
+tflite::MicroInterpreter * pnet_2_interpreter = nullptr;
+tflite::MicroInterpreter * pnet_3_interpreter = nullptr;
+tflite::MicroInterpreter * rnet_interpreter = nullptr;
+tflite::MicroInterpreter * onet_interpreter = nullptr;
+
+/* Private functions declaration ---------------------------------------------*/
+static esp_err_t nvs_init(void);
+static esp_err_t wifi_init(void);
+static esp_err_t spiffs_init(void);
+static esp_err_t camera_init(void);
+
+/* Event handlers */
+static void wifi_event_handler(void * arg, esp_event_base_t event_base,
+		int32_t event_id, void * event_data);
+static void ip_event_handler(void * arg, esp_event_base_t event_base,
+		int32_t event_id, void * event_data);
+
+static void tflm_init(void);
+static void inference_task(void * arg);
+
+void io_init(){
+    //OUTPUT INPUT Set up *******************************************************************************************************
+    //zero-initialize the config structure.
+    gpio_config_t io_conf = {};
+    //disable interrupt
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    //set as output mode
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    //bit mask of the pins that you want to set,e.g.21
+    io_conf.pin_bit_mask = GPIO_OUTPUT_PIN_SEL;
+    //disable pull-down mode
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    //disable pull-up mode
+    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+    //configure GPIO with the given settings
+    gpio_config(&io_conf);
+
+    gpio_set_level(gpio_num, 1);
+}
+
+/* Private user code ---------------------------------------------------------*/
+extern "C" void app_main() {
+
+	/* Initialize TFLM and allocate tensors for the models */
+	io_init();
+	tflm_init();
+
+  /* Initialize Camera */
+  ESP_ERROR_CHECK(camera_init());
+
+	/* Create RTOS tasks to run inferences */
+	xTaskCreate(inference_task,
+			"Inference Task",
+			configMINIMAL_STACK_SIZE * 8,
+			NULL,
+			tskIDLE_PRIORITY + 8,
+			NULL);
+}
+
+/* Private functions definition ----------------------------------------------*/
+static esp_err_t nvs_init(void) {
+	esp_err_t ret;
+
+	ESP_LOGI(TAG, "Initializing NVS...");
+
+    ret = nvs_flash_init();
+
+    if(ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    	ret = nvs_flash_erase();
+
+    	if(ret == ESP_OK) {
+    		ret = nvs_flash_init();
+
+    		if(ret != ESP_OK) {
+    			ESP_LOGE(TAG, "Error initializing NVS");
+
+    			return ret;
+    		}
+    	}
+    	else {
+    		ESP_LOGE(TAG, "Error erasing NVS");
+
+    		return ret;
+    	}
+
+    }
+
+	return ret;
+}
+
+static esp_err_t wifi_init(void) {
+	esp_err_t ret = ESP_OK;
+
+	ESP_LOGI(TAG, "Initializing Wi-Fi...");
+
+	/* Initialize stack TCP/IP */
+	ret = esp_netif_init();
+
+	if (ret != ESP_OK) {
+		return ret;
+	}
+
+	/* Create event loop */
+	ret = esp_event_loop_create_default();
+
+	if (ret != ESP_OK) {
+		return ret;
+	}
+
+	/* Create netif instances */
+	esp_netif_create_default_wifi_sta();
+
+	/* Initialize Wi-Fi driver*/
+	wifi_init_config_t wifi_config = WIFI_INIT_CONFIG_DEFAULT();
+	esp_wifi_init(&wifi_config);
+
+	/* Declare event handler instances for Wi-Fi and IP */
+	esp_event_handler_instance_t instance_any_wifi;
+	esp_event_handler_instance_t instance_got_ip;
+
+	/* Register Wi-Fi, IP and SmartConfig event handlers */
+	ret = esp_event_handler_instance_register(WIFI_EVENT,
+			ESP_EVENT_ANY_ID,
+			&wifi_event_handler,
+			NULL,
+			&instance_any_wifi);
+
+	if (ret != ESP_OK) {
+		return ret;
+	}
+
+	ret = esp_event_handler_instance_register(IP_EVENT,
+			IP_EVENT_STA_GOT_IP,
+			&ip_event_handler,
+			NULL,
+			&instance_got_ip);
+
+	if (ret != ESP_OK) {
+		return ret;
+	}
+
+	/* Set Wi-Fi mode */
+	ret = esp_wifi_set_mode(WIFI_MODE_STA);
+
+	if (ret != ESP_OK) {
+		return ret;
+	}
+
+	/* Start Wi-Fi */
+	ret = esp_wifi_start();
+
+	if (ret != ESP_OK) {
+		return ret;
+	}
+
+	/* Try to connect with the current credentials */
+  wifi_config_t wifi_cfg = {
+      .sta = {
+          .ssid = CONFIG_WIFI_STA_SSID,
+          .password = CONFIG_WIFI_STA_PASS,
+      },
+  };
+
+	ESP_LOGI(TAG, "Connecting to %s...", wifi_cfg.sta.ssid);
+
+	ret = esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg);
+
+	if (ret != ESP_OK) {
+		ESP_LOGE(TAG, "Error setting the statation configuration");
+		return ret;
+	}
+
+	ret = esp_wifi_connect();
+
+	if (ret != ESP_OK) {
+		ESP_LOGE(TAG, "Error connecting to %s", wifi_cfg.sta.ssid);
+		return ret;
+	}
+
+	return ret;
+}
+
+static esp_err_t spiffs_init(void) {
+	esp_err_t ret;
+
+	esp_spiffs_format(NULL);
+    ESP_LOGI(TAG, "Initializing SPIFFS...");
+
+    esp_vfs_spiffs_conf_t conf = {
+      .base_path = "/spiffs",
+      .partition_label = NULL,
+      .max_files = 5,
+      .format_if_mount_failed = true
+    };
+
+    ret = esp_vfs_spiffs_register(&conf);
+
+    if(ret != ESP_OK) {
+        if(ret == ESP_FAIL) {
+            ESP_LOGE(TAG, "Failed to mount or format filesystem");
+        }
+        else if(ret == ESP_ERR_NOT_FOUND) {
+            ESP_LOGE(TAG, "Failed to find SPIFFS partition");
+        }
+        else {
+            ESP_LOGE(TAG, "Failed to initialize SPIFFS (%s)", esp_err_to_name(ret));
+        }
+
+        return ret ;
+    }
+
+    size_t total = 0, used = 0;
+
+    ret = esp_spiffs_info(conf.partition_label, &total, &used);
+
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to get SPIFFS partition information (%s)", esp_err_to_name(ret));
+
+        return ret;
+    }
+    else {
+        ESP_LOGI(TAG, "Partition size: total: %d, used: %d", total, used);
+    }
+
+	return ret;
+}
+
+static void tflm_init(void) {
+//	tflite::ErrorReporter* error_reporter = nullptr;
+//  tflite::MicroErrorReporter micro_error_reporter;
+//  error_reporter = &micro_error_reporter;
+
+  /* Map the model into a usable data structure */
+  const tflite::Model * pnet_1_model = tflite::GetModel(pnet_1_model_data);
+  if (pnet_1_model->version() != TFLITE_SCHEMA_VERSION) {
+    MicroPrintf("Model provided is schema version %d not equal to supported "
+    		"version %d.", pnet_1_model->version(), TFLITE_SCHEMA_VERSION);
+    return;
+  }
+
+  const tflite::Model * pnet_2_model = tflite::GetModel(pnet_2_model_data);
+  if (pnet_2_model->version() != TFLITE_SCHEMA_VERSION) {
+    MicroPrintf("Model provided is schema version %d not equal to supported "
+    		"version %d.", pnet_2_model->version(), TFLITE_SCHEMA_VERSION);
+    return;
+  }
+
+  const tflite::Model * pnet_3_model = tflite::GetModel(pnet_3_model_data);
+  if (pnet_3_model->version() != TFLITE_SCHEMA_VERSION) {
+    MicroPrintf("Model provided is schema version %d not equal to supported "
+    		"version %d.", pnet_3_model->version(), TFLITE_SCHEMA_VERSION);
+    return;
+  }
+
+  const tflite::Model * rnet_model = tflite::GetModel(rnet_model_data);
+  if (rnet_model->version() != TFLITE_SCHEMA_VERSION) {
+    MicroPrintf("Model provided is schema version %d not equal to supported "
+    		"version %d.", rnet_model->version(), TFLITE_SCHEMA_VERSION);
+    return;
+  }
+
+  const tflite::Model * onet_model = tflite::GetModel(onet_model_data);
+  if (rnet_model->version() != TFLITE_SCHEMA_VERSION) {
+    MicroPrintf("Model provided is schema version %d not equal to supported "
+    		"version %d.", onet_model->version(), TFLITE_SCHEMA_VERSION);
+    return;
+  }
+
+  /* Reserve memory */
+  uint8_t * tensor_arena = (uint8_t *) heap_caps_malloc(TENSOR_ARENA_SIZE, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+
+  if (tensor_arena == NULL) {
+    printf("Couldn't allocate memory of %d bytes\n", TENSOR_ARENA_SIZE);
+    return;
+  }
+
+  /* Pull in only the operation implementations we need. This relies on a
+   * complete list of all the ops needed by this graph. An easier approach is to
+   * just use the AllOpsResolver, but this will incur some penalty in code space
+   * for op implementations that are not needed by this graph
+   *
+   */
+  static tflite::MicroMutableOpResolver<10> micro_op_resolver;
+  micro_op_resolver.AddAveragePool2D();
+  micro_op_resolver.AddConv2D();
+  micro_op_resolver.AddPrelu();
+  micro_op_resolver.AddMaxPool2D();
+  micro_op_resolver.AddTranspose();
+  micro_op_resolver.AddFullyConnected();
+  micro_op_resolver.AddDequantize();
+  micro_op_resolver.AddDepthwiseConv2D();
+  micro_op_resolver.AddReshape();
+  micro_op_resolver.AddSoftmax();
+
+  /* Build an interpreter to run the model with */
+  static tflite::MicroInterpreter static_pnet_1_interpreter(
+  		pnet_1_model, micro_op_resolver, tensor_arena, TENSOR_ARENA_SIZE);
+  pnet_1_interpreter = &static_pnet_1_interpreter;
+
+  static tflite::MicroInterpreter static_pnet_2_interpreter(
+  		pnet_2_model, micro_op_resolver, tensor_arena, TENSOR_ARENA_SIZE);
+  pnet_2_interpreter = &static_pnet_2_interpreter;
+
+  static tflite::MicroInterpreter static_pnet_3_interpreter(
+    		pnet_3_model, micro_op_resolver, tensor_arena, TENSOR_ARENA_SIZE);
+    pnet_3_interpreter = &static_pnet_3_interpreter;
+
+  static tflite::MicroInterpreter static_rnet_interpreter(
+  		rnet_model, micro_op_resolver, tensor_arena, TENSOR_ARENA_SIZE);
+  rnet_interpreter = &static_rnet_interpreter;
+
+  static tflite::MicroInterpreter static_onet_interpreter(
+  		onet_model, micro_op_resolver, tensor_arena, TENSOR_ARENA_SIZE);
+  onet_interpreter = &static_onet_interpreter;
+
+  /* Allocate memory from the tensor_arena for the model's tensors */
+  TfLiteStatus allocate_status = pnet_1_interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+    MicroPrintf("AllocateTensors() failed");
+    return;
+  }
+
+  allocate_status = pnet_2_interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+    MicroPrintf("AllocateTensors() failed");
+    return;
+  }
+
+  allocate_status = pnet_3_interpreter->AllocateTensors();
+	if (allocate_status != kTfLiteOk) {
+    MicroPrintf("AllocateTensors() failed");
+		return;
+	}
+
+  allocate_status = rnet_interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+  	MicroPrintf("AllocateTensors() failed");
+    return;
+  }
+
+  allocate_status = onet_interpreter->AllocateTensors();
+  if (allocate_status != kTfLiteOk) {
+  	MicroPrintf("AllocateTensors() failed");
+    return;
+  }
+}
+
+static esp_err_t camera_init(void) {
+	esp_err_t ret = ESP_OK;
+
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer = LEDC_TIMER_0;
+  config.pin_d0 = CONFIG_CAMERA_PIN_D0;
+  config.pin_d1 = CONFIG_CAMERA_PIN_D1;
+  config.pin_d2 = CONFIG_CAMERA_PIN_D2;
+  config.pin_d3 = CONFIG_CAMERA_PIN_D3;
+  config.pin_d4 = CONFIG_CAMERA_PIN_D4;
+  config.pin_d5 = CONFIG_CAMERA_PIN_D5;
+  config.pin_d6 = CONFIG_CAMERA_PIN_D6;
+  config.pin_d7 = CONFIG_CAMERA_PIN_D7;
+  config.pin_xclk = CONFIG_CAMERA_PIN_XCLK;
+  config.pin_pclk = CONFIG_CAMERA_PIN_PCLK;
+  config.pin_vsync = CONFIG_CAMERA_PIN_VSYNC;
+  config.pin_href = CONFIG_CAMERA_PIN_HREF;
+  config.pin_sccb_sda = CONFIG_CAMERA_PIN_SIOD;
+  config.pin_sccb_scl = CONFIG_CAMERA_PIN_SIOC;
+  config.pin_pwdn = CONFIG_CAMERA_PIN_PWDN;
+  config.pin_reset = CONFIG_CAMERA_PIN_RESET;
+  config.xclk_freq_hz = 15000000;
+  config.pixel_format = PIXFORMAT_RGB565;
+  config.frame_size = CAM_FRAMESIZE;
+  config.jpeg_quality = 0;
+  config.fb_count = 2;
+  config.fb_location = CAMERA_FB_IN_PSRAM;
+
+  /* Camera initialization */
+  ret = esp_camera_init(&config);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Camera initialization failed");
+    return ret;
+  }
+
+  sensor_t * s = esp_camera_sensor_get();
+  s->set_vflip(s, 1); /* flip it back */
+
+  return ret;
+}
+
+static void inference_task(void * arg) {
+	for(;;) {
+		long long start_time = esp_timer_get_time();
+
+		/* Get image */
+	  camera_fb_t* fb = esp_camera_fb_get();
+	  if (!fb) {
+	    ESP_LOGE(TAG, "Camera capture failed");
+	  }
+
+		/* Convert to RGB888 and return frame buffer*/
+	  uint8_t * rgb888_image = (uint8_t *)malloc((IMG_W * IMG_H * IMG_CH) * sizeof(uint8_t));
+	  fmt2rgb888(fb->buf, fb->len, PIXFORMAT_RGB565, rgb888_image);
+//	  esp_camera_fb_return(fb);
+
+	  /* Run P-Net for all scales */
+	  candidate_windows_t pnet_candidate_windows;
+	  pnet_candidate_windows.candidate_window = NULL;
+	  pnet_candidate_windows.len = 0;
+
+	  run_pnet(&pnet_candidate_windows, pnet_1_interpreter, rgb888_image, IMG_W, IMG_H, PNET_1_SCALE);
+	  run_pnet(&pnet_candidate_windows, pnet_2_interpreter, rgb888_image, IMG_W, IMG_H, PNET_2_SCALE);
+	  run_pnet(&pnet_candidate_windows, pnet_3_interpreter, rgb888_image, IMG_W, IMG_H, PNET_3_SCALE);
+	  nms(&pnet_candidate_windows, NMS_THRESHOLD, IOU_MODE);
+
+	  bboxes_t * pnet_bboxes;
+	  get_calibrated_boxes(&pnet_bboxes, &pnet_candidate_windows);
+	  free(pnet_candidate_windows.candidate_window);
+
+	  square_boxes(pnet_bboxes);
+	  correct_boxes(pnet_bboxes, IMG_W, IMG_H);
+
+	  long long pnet_time = (esp_timer_get_time() - start_time);
+
+	  /* Run R-Net */
+	  start_time = esp_timer_get_time();
+
+	  candidate_windows_t rnet_candidate_windows;
+	  rnet_candidate_windows.candidate_window = NULL;
+	  rnet_candidate_windows.len = 0;
+
+	  run_rnet(&rnet_candidate_windows, rnet_interpreter, rgb888_image, IMG_W, IMG_H, pnet_bboxes);
+	  nms(&rnet_candidate_windows, NMS_THRESHOLD, IOU_MODE);
+
+	  bboxes_t * rnet_bboxes;
+	  get_calibrated_boxes(&rnet_bboxes, &rnet_candidate_windows);
+	  free(rnet_candidate_windows.candidate_window);
+
+	  square_boxes(rnet_bboxes);
+	  correct_boxes(rnet_bboxes, IMG_W, IMG_H);
+
+	  long long rnet_time = (esp_timer_get_time() - start_time);
+
+	  /* Run O-Net */
+	  start_time = esp_timer_get_time();
+
+	  candidate_windows_t onet_candidate_windows;
+	  onet_candidate_windows.candidate_window = NULL;
+	  onet_candidate_windows.len = 0;
+
+	  run_onet(&onet_candidate_windows, onet_interpreter, rgb888_image, IMG_W, IMG_H, rnet_bboxes);
+	  nms(&onet_candidate_windows, NMS_THRESHOLD, IOU_MODE);
+
+	  bboxes_t * onet_bboxes;
+	  get_calibrated_boxes(&onet_bboxes, &onet_candidate_windows);
+	  free(onet_candidate_windows.candidate_window);
+
+	  square_boxes(onet_bboxes);
+	  correct_boxes(onet_bboxes, IMG_W, IMG_H);
+
+	  long long onet_time = (esp_timer_get_time() - start_time);
+
+		if (onet_bboxes->len > 0) {
+			/* Print MTCNN times and bboxes */
+		  	printf("P-Net time : %lld, bboxes : %d\n", pnet_time / 1000, pnet_bboxes->len);
+		  	printf("R-Net time : %lld, bboxes : %d\n", rnet_time / 1000, rnet_bboxes->len);
+		  	printf("O-Net time : %lld, bboxes : %d\n", onet_time / 1000, onet_bboxes->len);
+			printf("MTCNN time : %lld, bboxes : %d\r\n", (pnet_time + rnet_time + onet_time) / 1000, onet_bboxes->len);
+
+			/* Open file */
+
+			size_t cnv_buf_len;
+			uint8_t * cnv_buf = NULL;
+
+			/* Draw bboxes and save the file */
+			draw_rectangle_rgb888(rgb888_image, onet_bboxes, IMG_W);
+			fmt2jpg(rgb888_image, IMG_W * IMG_H, IMG_W, IMG_H, PIXFORMAT_RGB888, 80, &cnv_buf, &cnv_buf_len);
+
+			free(cnv_buf);
+		}
+
+		/* Free all the bboxes */
+	  free(pnet_bboxes->bbox);
+	  free(pnet_bboxes);
+	  free(rnet_bboxes->bbox);
+	  free(rnet_bboxes);
+	  free(onet_bboxes->bbox);
+	  free(onet_bboxes);
+	  free(rgb888_image);
+
+	  /* Return the cammera frame buffer */
+	  esp_camera_fb_return(fb);
+
+	  /* To avoid watchdog */
+	  vTaskDelay(pdMS_TO_TICKS(20));
+	}
+}
+
+/* Event handlers */
+static void wifi_event_handler(void * arg, esp_event_base_t event_base,
+							   int32_t event_id, void * event_data) {
+	switch (event_id) {
+		case WIFI_EVENT_STA_START: {
+			ESP_LOGI(TAG, "WIFI_EVENT_STA_START");
+
+			break;
+		}
+
+		case WIFI_EVENT_STA_CONNECTED: {
+			ESP_LOGI(TAG, "WIFI_EVENT_STA_CONNECTED");
+
+			break;
+		}
+
+		case WIFI_EVENT_STA_DISCONNECTED: {
+			ESP_LOGI(TAG, "WIFI_EVENT_STA_DISCONNECTED");
+
+	        break;
+		}
+
+		default:
+			ESP_LOGI(TAG, "Other Wi-Fi event");
+			break;
+	}
+}
+
+static void ip_event_handler(void * arg, esp_event_base_t event_base,
+		int32_t event_id, void * event_data) {
+	switch (event_id) {
+		case IP_EVENT_STA_GOT_IP: {
+			ESP_LOGI(TAG, "IP_EVENT_STA_GOT_IP");
+
+			break;
+		}
+
+		default: {
+			ESP_LOGI(TAG, "Other IP event");
+
+			break;
+		}
+	}
+}
+
+/***************************** END OF FILE ************************************/

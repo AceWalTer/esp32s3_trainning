@@ -1,0 +1,143 @@
+menu "App Configuration"
+
+menu "Wi-Fi Configuration"
+config WIFI_STA_SSID
+	string "Wi-Fi station SSID" 
+	help
+		SSID to connect in station mode.
+
+config WIFI_STA_PASS
+	string "Wi-Fi station password" 
+	help
+		Password of the SSID to connect in station mode.
+endmenu
+
+menu "Camera Configuration"
+config CAMERA_PIN_PWDN
+    int "Power Down pin"
+    range -1 33
+    default -1
+    help
+        Select Power Down pin or -1 for unmanaged.
+
+config CAMERA_PIN_RESET
+    int "Reset pin"
+    range -1 33
+    default -1
+    help
+        Select Camera Reset pin or -1 for software reset.
+
+config CAMERA_PIN_XCLK
+    int "XCLK pin"
+    range 0 33
+    default 15
+    help
+        Select Camera XCLK pin.
+
+config CAMERA_PIN_SIOD
+    int "SIOD pin"
+    range 0 33
+    default 4
+    help
+        Select Camera SIOD pin.
+
+config CAMERA_PIN_SIOC
+    int "SIOC pin"
+    range 0 33
+    default 5
+    help
+        Select Camera SIOC pin.
+
+config CAMERA_PIN_VSYNC
+    int "VSYNC pin"
+    range 0 39
+    default 6
+    help
+        Select Camera VSYNC pin.
+
+config CAMERA_PIN_HREF
+    int "HREF pin"
+    range 0 39
+    default 7
+    help
+        Select Camera HREF pin.
+
+config CAMERA_PIN_PCLK
+    int "PCLK pin"
+    range 0 39
+    default 13
+    help
+        Select Camera PCLK pin.
+
+config CAMERA_PIN_D0
+    int "D0 pin"
+    range 0 39
+    default 11
+    help
+        Select Camera D0 pin.
+        
+config CAMERA_PIN_D1
+    int "D1 pin"
+    range 0 39
+    default 9
+    help
+        Select Camera D1 pin.
+
+config CAMERA_PIN_D2
+    int "D2 pin"
+    range 0 39
+    default 8
+    help
+        Select Camera D2 pin.
+
+config CAMERA_PIN_D3
+    int "D3 pin"
+    range 0 39
+    default 10
+    help
+        Select Camera D3 pin.
+
+config CAMERA_PIN_D4
+    int "D4 pin"
+    range 0 39
+    default 12
+    help
+        Select Camera D4 pin.
+
+config CAMERA_PIN_D5
+    int "D5 pin"
+    range 0 39
+    default 18
+    help
+        Select Camera D5 pin.
+
+config CAMERA_PIN_D6
+    int "D6 pin"
+    range 0 39
+    default 17
+    help
+        Select Camera D6 pin.
+
+config CAMERA_PIN_D7
+    int "D7 pin"
+    range 0 39
+    default 16
+    help
+        Select Camera D7 pin.
+
+config CAMERA_PIN_D8
+    int "D8 pin"
+    range 0 39
+    default 34
+    help
+        Select Camera D8 pin.
+
+config CAMERA_PIN_D9
+    int "D9 pin"
+    range 0 39
+    default 35
+    help
+        Select Camera D9 pin.
+endmenu
+
+endmenu
